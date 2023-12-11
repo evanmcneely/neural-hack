@@ -29,9 +29,25 @@ if !s:has_features
     finish
 endif
 
+" Have Neural write to the buffer given a prompt.
 command! -nargs=? Neural :call neural#Prompt(<q-args>)
 command! -nargs=? NeuralWithBuffers :call neural#PromptWithBuffers(<q-args>)
+" Stop Neural doing anything.
+command! -nargs=0 NeuralStop :call neural#Stop()
+" Have Neural explain the visually selected lines.
+command! -range NeuralExplain :call neural#explain#SelectedLines()
 
 " <Plug> mappings for commands
-nnoremap <Plug>(neural_prompt) :call neural#OpenPrompt()<Return>
-nnoremap <Plug>(neural_prompt_with_file_picker) :call neural#PromptWithBuffers()<Return>
+nnoremap <silent> <Plug>(neural_prompt) :call neural#OpenPrompt()<Return>
+nnoremap <silent> <Plug>(neural_prompt_with_file_picker) :call neural#PromptWithBuffers()<Return>
+nnoremap <silent> <Plug>(neural_stop) :call neural#Stop()<Return>
+vnoremap <silent> <Plug>(neural_explain) :NeuralExplain<Return>
+
+" Set default keybinds for Neural unless we're told not to. We should almost
+" never define keybinds by default in a plugin, but we can add only a few to
+" make things convenient for users.
+if has_key(g:, 'neural') && get(g:neural, 'set_default_keybinds')
+    if empty(maparg("\<C-c>", 'n'))
+        nnoremap <C-c> <Plug>(neural_stop)
+    endif
+endif

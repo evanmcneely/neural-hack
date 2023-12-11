@@ -1,4 +1,3 @@
-
 " Author: evanmcneely <evanmcneely@me.com>
 " Description: Pre-processing rules for Vimscript files.
 

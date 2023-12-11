@@ -2,6 +2,8 @@
 A Neural datasource for ChatGPT conversations.
 """
 import json
+import platform
+import ssl
 import sys
 import urllib.error
 import urllib.request
@@ -21,6 +23,7 @@ class Config:
     def __init__(
         self,
         api_key: str,
+        model: str,
         temperature: float,
         top_p: float,
         # max_tokens: int,
@@ -28,6 +31,7 @@ class Config:
         frequency_penalty: float,
     ):
         self.api_key = api_key
+        self.model = model
         self.temperature = temperature
         self.top_p = top_p
         # self.max_tokens = max_tokens
@@ -44,7 +48,7 @@ def get_chatgpt_completion(
         "Authorization": f"Bearer {config.api_key}",
     }
     data = {
-        "model": "gpt-4",
+        "model": config.model,
         "messages": (
             [
                 {
@@ -72,7 +76,18 @@ def get_chatgpt_completion(
     )
     role: Optional[str] = None
 
-    with urllib.request.urlopen(req) as response:
+    # Disable SSL certificate verification on macOS.
+    # This is bad for security, and we need to deal with SSL errors better.
+    #
+    # This is the error:
+    # urllib.error.URLError: <urlopen error [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate (_ssl.c:997)>  # noqa
+    context = (
+        ssl._create_unverified_context()  # type: ignore
+        if platform.system() == "Darwin" else
+        None
+    )
+
+    with urllib.request.urlopen(req, context=context) as response:
         while True:
             line_bytes = response.readline()
 
@@ -107,7 +122,12 @@ def load_config(raw_config: Dict[str, Any]) -> Config:
     if not isinstance(api_key, str) or not api_key:  # type: ignore
         raise ValueError("chatgpt.api_key is not defined")
 
-    temperature = raw_config.get("temperature", 0.2)
+    model = raw_config.get('model')
+
+    if not isinstance(model, str) or not model:
+        raise ValueError("chatgpt.model is not defined")
+
+    temperature = raw_config.get('temperature', 0.2)
 
     if not isinstance(temperature, (int, float)):
         raise ValueError("chatgpt.temperature is invalid")
@@ -134,12 +154,37 @@ def load_config(raw_config: Dict[str, Any]) -> Config:
 
     return Config(
         api_key=api_key,
+        model=model,
         temperature=temperature,
         top_p=top_p,
         # max_tokens=max_tokens,
         presence_penalty=presence_penalty,
         frequency_penalty=presence_penalty,
     )
+
+
+def get_error_message(error: urllib.error.HTTPError) -> str:
+    message = error.read().decode('utf-8', errors='ignore')
+
+    try:
+        # JSON data might look like this:
+        # {
+        #   "error": {
+        #       "message": "...",
+        #       "type": "...",
+        #       "param": null,
+        #       "code": null
+        #   }
+        # }
+        message = json.loads(message)['error']['message']
+
+        if "This model's maximum context length is" in message:
+            message = 'Too much text for a request!'
+    except Exception:
+        # If we can't get a better message use the JSON payload at least.
+        pass
+
+    return message
 
 
 def main() -> None:
@@ -152,8 +197,11 @@ def main() -> None:
 
     try:
         get_chatgpt_completion(config, input_data["prompt"])
-    except urllib.error.URLError as error:
-        if isinstance(error, urllib.error.HTTPError) and error.code == 429:
+    except urllib.error.HTTPError as error:
+        if error.code == 400:
+            message = get_error_message(error)
+            sys.exit('Neural error: OpenAI request failure: ' + message)
+        elif error.code == 429:
             sys.exit("Neural error: OpenAI request limit reached!")
         else:
             raise

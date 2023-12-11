@@ -7,11 +7,15 @@ let s:neural_script_dir = expand('<sfile>:p:h:h') . '/neural_sources'
 let s:current_job = get(s:, 'current_job', 0)
 " Keep track of the line the last request happened on.
 let s:request_line = get(s:, 'request_line', 0)
+let s:initial_timer = get(s:, 'initial_timer', -1)
+let s:busy_timer = get(s:, 'busy_timer', -1)
 
 " A function purely for tests to be able to reset state
 function! neural#ResetState() abort
     let s:current_job = 0
     let s:request_line = 0
+    let s:initial_timer = -1
+    let s:busy_timer = -1
 endfunction
 
 " Get the Neural scripts directory in a way that makes it hard to modify.
@@ -19,7 +23,9 @@ function! neural#GetScriptDir() abort
     return s:neural_script_dir
 endfunction
 
-function! s:OutputErrorMessage(message) abort
+" Output an error message. The message should be a string.
+" The output error lines will be split in a platform-independent way.
+function! neural#OutputErrorMessage(message) abort
     let l:lines = split(a:message, '\v\r\n|\n|\r')
 
     if len(l:lines) > 0
@@ -102,7 +108,7 @@ function! s:HandleOutputEnd(buffer, job_data, exit_code) abort
 
     " Output an error message from the program if something goes wrong.
     if a:exit_code != 0
-        call s:OutputErrorMessage(join(a:job_data.error_lines, "\n"))
+        call neural#OutputErrorMessage(join(a:job_data.error_lines, "\n"))
     else
         " Signal Neural is done for plugin integration.
         silent doautocmd <nomodeline> User NeuralWritePost
@@ -112,6 +118,8 @@ function! s:HandleOutputEnd(buffer, job_data, exit_code) abort
             echomsg 'Neural is done!'
         endif
     endif
+
+    let s:current_job = 0
 endfunction
 
 " Get the path to the executable for a script language.
@@ -153,8 +161,10 @@ function! neural#Escape(str) abort
     return shellescape (a:str)
 endfunction
 
+" Complain about no prompt text being provided.
+" This function is also called from Lua code.
 function! neural#ComplainNoPromptText() abort
-    call s:OutputErrorMessage('No prompt text!')
+    call neural#OutputErrorMessage('No prompt text!')
 endfunction
 
 function! neural#OpenPrompt() abort
@@ -198,12 +208,34 @@ function! s:InformUserIfStillBusy(job_id) abort
 endfunction
 
 function! neural#Cleanup() abort
-    " Stop any currently running jobs.
-    call neural#job#Stop(s:current_job)
+    " Stop :NeuralExplain if it might be running.
+    if exists('*neural#explain#Cleanup')
+        call neural#explain#Cleanup()
+    endif
+
+    if s:current_job
+        " Stop any currently running jobs.
+        call neural#job#Stop(s:current_job)
+        let s:current_job = 0
+    endif
+
+    " Stop timers for informing the user.
+    call timer_stop(s:initial_timer)
+    call timer_stop(s:busy_timer)
 
     " Remove any current signs.
     if has('nvim')
         execute 'lua require(''neural'').stop_animated_sign(' . s:request_line . ')'
+    endif
+endfunction
+
+function! neural#Stop() abort
+    let l:was_running = neural#job#IsRunning(s:current_job)
+    call neural#Cleanup()
+
+    if l:was_running && g:neural.ui.echo_enabled
+        " no-custom-checks
+        echomsg 'Neural stopped.'
     endif
 endfunction
 
@@ -235,6 +267,46 @@ function! GetSelectedText() abort
   return join(getline(l:start_line, l:end_line), '\n')
 endfunction
 
+function! s:LoadDataSource() abort
+    let l:selected = g:neural.selected
+
+    try
+        let l:source = function('neural#source#' . selected . '#Get')()
+    catch /E117/
+        call neural#OutputErrorMessage('Invalid source: ' . l:selected)
+
+        return
+    endtry
+
+    return l:source
+endfunction
+
+function! s:GetSourceInput(buffer, source, prompt) abort
+    let l:config = get(g:neural.source, a:source.name, {})
+
+    " If the config is not a Dictionary, throw it away.
+    if type(l:config) isnot v:t_dict
+        let l:config = {}
+    endif
+
+    let l:input = {'config': l:config, 'prompt': a:prompt}
+
+    " Pre-process input, such as modifying a prompt.
+    call neural#PreProcess(a:buffer, l:input)
+
+    return l:input
+endfunction
+
+function! neural#GetCommand(buffer) abort
+    let l:source = s:LoadDataSource()
+    let l:script_exe = s:GetScriptExecutable(l:source)
+    let l:command = neural#Escape(l:script_exe)
+    \   . ' ' . neural#Escape(l:source.script)
+    let l:command = neural#job#PrepareCommand(a:buffer, l:command)
+
+    return [l:source, l:command]
+endfunction
+
 function! neural#Prompt(prompt) abort
     " Reload the Neural config on a prompt request if needed.
     call neural#config#Load()
@@ -244,7 +316,7 @@ function! neural#Prompt(prompt) abort
         if has('nvim') && g:neural.ui.prompt_enabled
             call neural#OpenPrompt()
         else
-            call s:OutputErrorMessage('No prompt text!')
+            call neural#ComplainNoPromptText()
         endif
 
         return
@@ -278,18 +350,19 @@ function! neural#Prompt(prompt) abort
         let l:moving_line -= 1
     endif
 
-    call neural#PreProcess(l:context, l:input)
+    " call neural#PreProcess(l:context, l:input)
 
-    let l:script_exe = s:GetScriptExecutable(l:source)
-    let l:command = neural#Escape(l:script_exe)
-    \   . ' ' . neural#Escape(l:source.script)
-    let l:command = neural#job#PrepareCommand(l:buffer, l:command)
+    " let l:script_exe = s:GetScriptExecutable(l:source)
+    " let l:command = neural#Escape(l:script_exe)
+    " \   . ' ' . neural#Escape(l:source.script)
+    " let l:command = neural#job#PrepareCommand(l:buffer, l:command)
+    let [l:source, l:command] = neural#GetCommand(l:buffer)
+
     let l:job_data = {
     \   'moving_line': l:moving_line,
     \   'error_lines': [],
     \   'content_started': 0,
     \}
-
     let l:job_id = neural#job#Start(l:command, {
     \   'mode': 'nl',
     \   'out_cb': {job_id, line -> s:AddLineToBuffer(l:buffer, l:job_data, line)},
@@ -298,11 +371,10 @@ function! neural#Prompt(prompt) abort
     \})
 
     if l:job_id > 0
-        let l:stdin_data = json_encode(l:input) . "\n"
-
-        call neural#job#SendRaw(l:job_id, l:stdin_data)
+        let l:input = s:GetSourceInput(l:buffer, l:source, a:prompt)
+        call neural#job#SendRaw(l:job_id, json_encode(l:input) . "\n")
     else
-        call s:OutputErrorMessage('Failed to run ' . l:source.name)
+        call neural#OutputErrorMessage('Failed to run ' . l:source.name)
 
         return
     endif
@@ -312,10 +384,10 @@ function! neural#Prompt(prompt) abort
     " Tell the user something is happening, if enabled.
     if g:neural.ui.echo_enabled
         " Echo with a 0 millisecond timer to avoid 'Press Enter to Continue'
-        call timer_start(0, {-> s:InitiallyInformUser(l:job_id)})
+        let s:initial_timer = timer_start(0, {-> s:InitiallyInformUser(l:job_id)})
 
         " If returning an answer takes a while, tell them again.
-        call timer_start(5000, {-> s:InformUserIfStillBusy(l:job_id)})
+        let s:busy_timer = timer_start(5000, {-> s:InformUserIfStillBusy(l:job_id)})
     endif
 
     if has('nvim')
@@ -382,12 +454,14 @@ function! neural#PromptWithBuffers(prompt) abort
         let l:moving_line -= 1
     endif
 
-    call neural#PreProcess(l:context, l:input)
+    " call neural#PreProcess(l:context, l:input)
 
-    let l:script_exe = s:GetScriptExecutable(l:source)
-    let l:command = neural#Escape(l:script_exe)
-    \   . ' ' . neural#Escape(l:source.script)
-    let l:command = neural#job#PrepareCommand(l:buffer, l:command)
+    " let l:script_exe = s:GetScriptExecutable(l:source)
+    " let l:command = neural#Escape(l:script_exe)
+    " \   . ' ' . neural#Escape(l:source.script)
+    " let l:command = neural#job#PrepareCommand(l:buffer, l:command)
+    let [l:source, l:command] = neural#GetCommand(l:buffer)
+
     let l:job_data = {
     \   'moving_line': l:moving_line,
     \   'error_lines': [],
@@ -426,159 +500,6 @@ function! neural#PromptWithBuffers(prompt) abort
         execute 'lua require(''neural'').start_animated_sign(' . s:request_line . ')'
     endif
 endfunction
-
-
-
-" Refactored functions
-" function! s:GetStartAndEndLines() abort
-"   let [_, l:start_line, _, _] = getpos("'<")
-"   let [_, l:end_line, _, _] = getpos("'>")
-"   return [l:start_line, l:end_line]
-" endfunction
-
-" function! GetSelectedText() abort
-"   let [l:start_line, l:end_line] = s:GetStartAndEndLines()
-
-"   " If start and end lines are the same, return an empty string
-"   if l:start_line == l:end_line
-"     return ''
-"   endif
-
-"   return join(getline(l:start_line, l:end_line), '\n')
-" endfunction
-
-" function! s:PreparePrompt(prompt) abort
-"   call neural#config#Load()
-"   call neural#Cleanup()
-
-"   if empty(a:prompt)
-"     if has('nvim') && g:neural.ui.prompt_enabled
-"       call neural#OpenPrompt()
-"     else
-"       call s:OutputErrorMessage('No prompt text!')
-"     endif
-
-"     return 0
-"   endif
-
-"   return 1
-" endfunction
-
-" function! s:GetSourceAndConfig(selected) abort
-"   let l:GetDatasource = function('neural#source#' . a:selected . '#Get')
-
-"   try
-"     let l:source = l:GetDatasource()
-"   catch /E117/
-"     call s:OutputErrorMessage('Invalid source: ' . a:selected)
-
-"     return ['', {}]
-"   endtry
-
-"   let l:config = get(g:neural.source, l:source.name, {})
-
-"   " If the config is not a Dictionary, throw it away.
-"   if type(l:config) isnot v:t_dict
-"     let l:config = {}
-"   endif
-
-"   return [l:source, l:config]
-" endfunction
-
-" function! s:RunNeuralJob(source, config, prompt, context) abort
-"   let l:input = {'config': a:config, 'prompt': a:prompt}
-"   let l:buffer = bufnr('')
-"   let l:moving_line = getpos('.')[1]
-"   let s:request_line = l:moving_line
-
-"   if len(getline(l:moving_line)) == 0
-"     let l:moving_line -= 1
-"   endif
-
-"   call neural#PreProcess(a:context, l:input)
-
-"   let l:script_exe = s:GetScriptExecutable(a:source)
-"   let l:command = neural#Escape(l:script_exe)
-"     \   . ' ' . neural#Escape(a:source.script)
-"   let l:command = neural#job#PrepareCommand(l:buffer, l:command)
-"   let l:job_data = {
-"     \   'moving_line': l:moving_line,
-"     \   'error_lines': [],
-"     \   'content_started': 0,
-"     \}
-
-"   let l:job_id = neural#job#Start(l:command, {
-"     \   'mode': 'nl',
-"     \   'out_cb': {job_id, line -> s:AddLineToBuffer(l:buffer, l:job_data, line)},
-"     \   'err_cb': {job_id, line -> s:AddErrorLine(l:buffer, l:job_data, line)},
-"     \   'exit_cb': {job_id, exit_code -> s:HandleOutputEnd(l:buffer, l:job_data, exit_code)},
-"     \})
-
-"   if l:job_id > 0
-"     let l:stdin_data = json_encode(l:input) . "\n"
-
-"     call neural#job#SendRaw(l:job_id, l:stdin_data)
-"   else
-"     call s:OutputErrorMessage('Failed to run ' . a:source.name)
-
-"     return
-"   endif
-
-"   let s:current_job = l:job_id
-
-"   " Tell the user something is happening, if enabled.
-"   if g:neural.ui.echo_enabled
-"     " Echo with a 0 millisecond timer to avoid 'Press Enter to Continue'
-"     call timer_start(0, {-> s:InitiallyInformUser(l:job_id)})
-
-"     " If returning an answer takes a while, tell them again.
-"     call timer_start(5000, {-> s:InformUserIfStillBusy(l:job_id)})
-"   endif
-
-"   if has('nvim')
-"     execute 'lua require(''neural'').start_animated_sign(' . s:request_line . ')'
-"   endif
-" endfunction
-
-" function! neural#Prompt(prompt) abort
-"   if !s:PreparePrompt(a:prompt)
-"     return
-"   endif
-
-"   let [l:source, l:config] = s:GetSourceAndConfig(g:neural.selected)
-"   let l:context = GetSelectedText()
-
-"   call s:RunNeuralJob(l:source, l:config, a:prompt, l:context)
-" endfunction
-
-" function! GetVisibleBuffers() abort
-"   " Get all the active buffers
-"   let l:visible_buffers = filter(range(1, bufnr('$')), 'bufexists(v:val) && getbufvar(v:val, "&buflisted") && win_findbuf(v:val) != []')
-
-"   " Get the text from all active buffers
-"   let l:buffer_texts = []
-"   for l:buffer in visible_buffers
-"     call add(l:buffer_texts, '\n-- ' . bufname(l:buffer) .join(getbufline(l:buffer, 1, '$'), "\n"))
-"   endfor
-
-"   " Combine the buffer texts with a separator
-"   let l:combined_text = join(l:buffer_texts, '\n\n"""\n\n')
-
-"   return l:combined_text
-" endfunction
-
-" function! neural#PromptWithBuffers(prompt) abort
-"   if !s:PreparePrompt(a:prompt)
-"     return
-"   endif
-
-"   let [l:source, l:config] = s:GetSourceAndConfig(g:neural.selected)
-"   let l:context = GetVisibleBuffers()
-
-"   call s:RunNeuralJob(l:source, l:config, a:prompt, l:context)
-" endfunction
-
-
 
 " Stop Neural doing things when you kill buffers, quit, or suspend.
 augroup NeuralCleanupGroup
